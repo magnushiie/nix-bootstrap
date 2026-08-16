@@ -91,12 +91,16 @@ prepare_ssh_dir() {
 # rc 0 = agent reachable and holding keys, 1 = reachable but empty, 2 = no agent.
 agent_has_keys() { ssh-add -l >/dev/null 2>&1; }
 
+# Whether the bridge below is ours to shut down again.
+agent_is_ours=false
+
 bridge_agent() {
     step "Bridging the Windows ssh-agent into WSL"
 
     if agent_has_keys; then
         info "an ssh-agent with keys is already reachable; leaving it alone"
     else
+        agent_is_ours=true
         # KeePassXC pushes its keys into the Windows OpenSSH agent service,
         # whose pipe name is fixed. </dev/null because Windows processes
         # started through WSL interop inherit fd 0 and read it dry, which would
@@ -136,6 +140,18 @@ fetch_config() {
     fi
 }
 
+# The bridge existed only to clone the private repo. The config installs a
+# service that owns that socket from here on, so release it before activating —
+# nothing below needs ssh, the flake's inputs come over https.
+release_agent() {
+    step "Releasing the socket for the config's own service"
+
+    # Not `wsl2-ssh-agent --stop`: that waits on a process which is not its
+    # child, so it always exits 1 after signalling. This is the same SIGTERM,
+    # and the daemon removes its socket on the way out.
+    pkill -u "$USER_NAME" -x wsl2-ssh-agent
+}
+
 # --inputs-from resolves the bare `home-manager` against the config's own
 # locked input, so the CLI is exactly the one the config is written for and is
 # already fetched. Left to the registry it would resolve to home-manager master
@@ -155,6 +171,9 @@ main() {
     bridge_agent
     check_github
     fetch_config
+    if $agent_is_ours; then
+        release_agent
+    fi
     activate
 
     step "Done"
