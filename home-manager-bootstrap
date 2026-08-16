@@ -47,11 +47,13 @@ die() {
 }
 
 # `curl | bash` leaves stdin pointing at the script itself, so prompts have to
-# read the terminal directly.
+# read the terminal directly. Interactivity is judged by stderr, since stdin is
+# the script even in a terminal: /dev/tty can be readable with nothing attached
+# to it, and a read there blocks forever rather than failing.
 pause() {
-    [ -r /dev/tty ] || die "$2"
+    { [ -t 2 ] && [ -r /dev/tty ]; } || die "$2"
     printf '\n%s' "$1" >&2
-    read -r _ </dev/tty || true
+    read -r -t 300 _ </dev/tty || true
     printf '\n' >&2
 }
 
