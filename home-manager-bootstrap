@@ -183,33 +183,17 @@ fetch_config() {
     fi
 }
 
-pick_attribute() {
-    [ -z "${HM_ATTR:-}" ] || return 0
-
-    local attrs candidate
-    attrs=$(nix eval --raw "$HM_DIR#homeConfigurations" \
-        --apply 'cs: builtins.concatStringsSep "\n" (builtins.attrNames cs)')
-    for candidate in "$USER_NAME@$HOST_NAME" "$USER_NAME" default; do
-        if printf '%s\n' "$attrs" | grep -qxF "$candidate"; then
-            HM_ATTR=$candidate
-            return 0
-        fi
-    done
-
-    die "no configuration for $USER_NAME@$HOST_NAME in $HM_DIR; it defines: $(printf '%s' "$attrs" | tr '\n' ' ')"
-}
-
+# The config's own flake exports the home-manager CLI built against the
+# home-manager it pins, so this runs the version the config is written for
+# rather than whatever $NIXPKGS happens to carry. Without an explicit HM_ATTR
+# the CLI picks the configuration itself, trying <user>@<fqdn>, <user>@<host>,
+# <user>@<shorthost>, then <user>.
 activate() {
-    local generation
+    step "Switching to the configuration"
 
-    step "Building homeConfigurations.\"$HM_ATTR\""
-    generation=$(nix build --no-link --print-out-paths \
-        "$HM_DIR#homeConfigurations.\"$HM_ATTR\".activationPackage")
-    info "$generation"
-
-    step "Activating"
     # Dotfiles that are in the way are kept as *.bak rather than aborting.
-    HOME_MANAGER_BACKUP_EXT=bak "$generation/activate"
+    nix run "$HM_DIR#home-manager" -- \
+        switch --flake "$HM_DIR${HM_ATTR:+#$HM_ATTR}" -b bak
 }
 
 main() {
@@ -218,12 +202,11 @@ main() {
     bridge_agent
     check_github
     fetch_config
-    pick_attribute
     activate
 
     step "Done"
     info "config checkout: $HM_DIR"
-    info "apply changes with: home-manager switch --flake $HM_DIR#$HM_ATTR"
+    info "apply changes with: home-manager switch --flake $HM_DIR"
     info "start a new login shell to pick up the environment: exec bash -l"
 }
 
