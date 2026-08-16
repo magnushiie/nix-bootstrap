@@ -26,9 +26,11 @@ HOST_NAME=$(uname -n)
 # NixOS ships without the flake features enabled, so pass them on every call.
 nix() { command nix --extra-experimental-features "nix-command flakes" "$@"; }
 
-# A fresh account has no git; borrow one from nixpkgs for as long as it takes to
-# clone the config. The `git` inside runs the real binary, not this function.
+# A fresh account has neither git nor jq; borrow them from nixpkgs for as long as
+# it takes to bootstrap. The inner names run the real binaries, not these
+# functions, since functions aren't inherited by non-bash children.
 git() { nix shell "$NIXPKGS#git" -c git "$@"; }
+jq() { nix shell "$NIXPKGS#jq" -c jq "$@"; }
 
 if [ -t 1 ]; then
     C_STEP=$'\033[1;34m' C_BOLD=$'\033[1m' C_WARN=$'\033[1;33m' C_ERR=$'\033[1;31m' C_OFF=$'\033[0m'
@@ -98,7 +100,7 @@ prepare_ssh_dir() {
             printf 'github.com %s\n' "$key" >>"$SSH_DIR/known_hosts"
             added=$((added + 1))
         fi
-    done < <(curl -fsSL https://api.github.com/meta | grep -o '"[a-z0-9-]* AAAA[^"]*"' | tr -d '"')
+    done < <(curl -fsSL https://api.github.com/meta | jq -r '.ssh_keys[]')
 
     info "github.com host keys: $added added"
 }
