@@ -67,6 +67,7 @@ check_environment() {
     if [ -z "${NIXPKGS_REF:-}" ]; then
         local release
         release=$(
+            # shellcheck source=/dev/null  # a system file, not part of the repo
             . /etc/os-release 2>/dev/null || true
             printf '%s' "${VERSION_ID:-}"
         )
@@ -111,23 +112,24 @@ agent_has_keys() { ssh-add -l >/dev/null 2>&1; }
 # Windows processes started through WSL interop inherit fd 0 and read it dry,
 # which would swallow the rest of this script when it arrives over a pipe.
 # Everything below that reaches Windows gets its own stdin.
+#
+# KeePassXC never serves the agent protocol itself — it pushes keys into the
+# Windows OpenSSH agent service or into Pageant, so those are the two pipes
+# worth asking for. The OpenSSH one has a fixed name; Pageant's carries a hash
+# of the user's SID, so it can only be matched, and matching it per-user keeps
+# another account's Pageant out of the picture.
 find_agent_pipe() {
-    local powershell pipes
+    local powershell
     powershell=$(command -v powershell.exe || true)
     [ -n "$powershell" ] || powershell=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
     [ -x "$powershell" ] || return 1
 
-    pipes=$("$powershell" -NoProfile -NonInteractive \
-        -Command '[System.IO.Directory]::GetFiles("\\.\pipe\")' 2>/dev/null </dev/null |
-        tr -d '\r' | sed 's|.*\\||')
-
-    # The Windows OpenSSH agent service when it is running, Pageant otherwise —
-    # KeePassXC serves whichever of the two it is configured for.
-    if printf '%s\n' "$pipes" | grep -qx 'openssh-ssh-agent'; then
-        printf 'openssh-ssh-agent'
-    else
-        printf '%s\n' "$pipes" | grep -i '^pageant\.' | head -n 1
-    fi
+    # shellcheck disable=SC2016  # $user is PowerShell's, not the shell's
+    "$powershell" -NoProfile -NonInteractive -Command '
+        $user = [Environment]::UserName
+        if (Test-Path "\\.\pipe\openssh-ssh-agent") { "openssh-ssh-agent" }
+        else { (Get-ChildItem "\\.\pipe\" -Filter "pageant.$user.*" | Select-Object -First 1).Name }
+    ' 2>/dev/null </dev/null | tr -d '\r' | head -n 1
 }
 
 bridge_agent() {
