@@ -183,16 +183,16 @@ fetch_config() {
     fi
 }
 
-# The config's own flake exports the home-manager CLI built against the
-# home-manager it pins, so this runs the version the config is written for
-# rather than whatever $NIXPKGS happens to carry. Without an explicit HM_ATTR
-# the CLI picks the configuration itself, trying <user>@<fqdn>, <user>@<host>,
-# <user>@<shorthost>, then <user>.
+# --inputs-from resolves the bare `home-manager` against the config's own
+# locked input, so the CLI is exactly the one the config is written for and is
+# already fetched. Left to the registry it would resolve to home-manager master
+# instead. Without an explicit HM_ATTR the CLI picks the configuration itself,
+# trying <user>@<fqdn>, <user>@<host>, <user>@<shorthost>, then <user>.
 activate() {
     step "Switching to the configuration"
 
     # Dotfiles that are in the way are kept as *.bak rather than aborting.
-    nix run "$HM_DIR#home-manager" -- \
+    nix run --inputs-from "$HM_DIR" home-manager -- \
         switch --flake "$HM_DIR${HM_ATTR:+#$HM_ATTR}" -b bak
 }
 
