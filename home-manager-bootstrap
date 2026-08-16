@@ -1,4 +1,225 @@
 #!/usr/bin/env bash
+#
+# home-manager-bootstrap — bring up home-manager on a fresh NixOS-WSL account.
+#
+#   curl -fsSL https://raw.githubusercontent.com/magnushiie/nix-bootstrap/refs/heads/main/home-manager-bootstrap | bash
+#
+# The config repo is private, so nothing can be cloned until an SSH key is
+# available. The keys live in KeePassXC on the Windows side, which serves them
+# through a Windows named pipe, so the first thing this does is bridge that pipe
+# into WSL with wsl2-ssh-agent. Everything after that is ordinary: clone the
+# config, build its activation package, activate it. The config then sets the
+# same bridge up permanently, so this is only needed once per account.
+#
+# Overridable via the environment: HM_REPO, HM_DIR, HM_ATTR, NIXPKGS_REF.
 
-echo 'Bootstrapping home-manager...'
+set -euo pipefail
 
+HM_REPO=${HM_REPO:-git@github.com:magnushiie/home-manager.git}
+HM_DIR=${HM_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/home-manager}
+
+SSH_DIR=$HOME/.ssh
+AGENT_SOCK=$SSH_DIR/wsl2-ssh-agent.sock
+USER_NAME=${USER:-$(id -un)}
+HOST_NAME=$(uname -n)
+
+# NixOS ships without the flake features enabled, so pass them explicitly.
+NIX=(nix --extra-experimental-features "nix-command flakes")
+
+if [ -t 1 ]; then
+    C_STEP=$'\033[1;34m' C_BOLD=$'\033[1m' C_WARN=$'\033[1;33m' C_ERR=$'\033[1;31m' C_OFF=$'\033[0m'
+else
+    C_STEP='' C_BOLD='' C_WARN='' C_ERR='' C_OFF=''
+fi
+
+step() { printf '\n%s==>%s %s%s%s\n' "$C_STEP" "$C_OFF" "$C_BOLD" "$*" "$C_OFF"; }
+info() { printf '    %s\n' "$*"; }
+warn() { printf '%swarning:%s %s\n' "$C_WARN" "$C_OFF" "$*" >&2; }
+die() {
+    printf '\n%serror:%s %s\n' "$C_ERR" "$C_OFF" "$*" >&2
+    exit 1
+}
+
+# `curl | bash` leaves stdin pointing at the script itself, so prompts have to
+# read the terminal directly.
+pause() {
+    [ -r /dev/tty ] || die "$2"
+    printf '\n%s' "$1" >&2
+    read -r _ </dev/tty || true
+    printf '\n' >&2
+}
+
+check_environment() {
+    step "Checking the environment"
+
+    command -v nix >/dev/null || die "nix not found; this script expects to run on NixOS."
+    grep -qi microsoft /proc/version 2>/dev/null ||
+        warn "this does not look like WSL; the ssh-agent bridge will not find a Windows agent."
+
+    # Track the running NixOS release so this keeps working on later releases
+    # without edits, falling back to unstable on pre-release systems.
+    if [ -z "${NIXPKGS_REF:-}" ]; then
+        local release
+        release=$(
+            . /etc/os-release 2>/dev/null || true
+            printf '%s' "${VERSION_ID:-}"
+        )
+        NIXPKGS_REF=nixos-unstable
+        if [ -n "$release" ] &&
+            curl -fsS -o /dev/null "https://api.github.com/repos/NixOS/nixpkgs/branches/nixos-$release"; then
+            NIXPKGS_REF=nixos-$release
+        fi
+    fi
+    NIXPKGS=github:nixos/nixpkgs/$NIXPKGS_REF
+
+    info "user:    $USER_NAME@$HOST_NAME"
+    info "nixpkgs: $NIXPKGS_REF"
+    info "config:  $HM_REPO -> $HM_DIR"
+}
+
+prepare_ssh_dir() {
+    step "Preparing $SSH_DIR"
+
+    mkdir -p "$SSH_DIR"
+    chmod 700 "$SSH_DIR"
+    touch "$SSH_DIR/known_hosts"
+    chmod 600 "$SSH_DIR/known_hosts"
+
+    # Take GitHub's host keys from its published metadata rather than trusting
+    # whatever answers on the first connection.
+    local key added=0
+    while read -r key; do
+        [ -n "$key" ] || continue
+        if ! grep -qxF "github.com $key" "$SSH_DIR/known_hosts"; then
+            printf 'github.com %s\n' "$key" >>"$SSH_DIR/known_hosts"
+            added=$((added + 1))
+        fi
+    done < <(curl -fsSL https://api.github.com/meta | grep -o '"[a-z0-9-]* AAAA[^"]*"' | tr -d '"')
+
+    info "github.com host keys: $added added"
+}
+
+# rc 0 = agent reachable and holding keys, 1 = reachable but empty, 2 = no agent.
+agent_has_keys() { ssh-add -l >/dev/null 2>&1; }
+
+# Windows processes started through WSL interop inherit fd 0 and read it dry,
+# which would swallow the rest of this script when it arrives over a pipe.
+# Everything below that reaches Windows gets its own stdin.
+find_agent_pipe() {
+    local powershell pipes
+    powershell=$(command -v powershell.exe || true)
+    [ -n "$powershell" ] || powershell=/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe
+    [ -x "$powershell" ] || return 1
+
+    pipes=$("$powershell" -NoProfile -NonInteractive \
+        -Command '[System.IO.Directory]::GetFiles("\\.\pipe\")' 2>/dev/null </dev/null |
+        tr -d '\r' | sed 's|.*\\||')
+
+    # The Windows OpenSSH agent service when it is running, Pageant otherwise —
+    # KeePassXC serves whichever of the two it is configured for.
+    if printf '%s\n' "$pipes" | grep -qx 'openssh-ssh-agent'; then
+        printf 'openssh-ssh-agent'
+    else
+        printf '%s\n' "$pipes" | grep -i '^pageant\.' | head -n 1
+    fi
+}
+
+bridge_agent() {
+    step "Bridging the Windows ssh-agent into WSL"
+
+    if agent_has_keys; then
+        info "an ssh-agent with keys is already reachable; leaving it alone"
+    else
+        local pipe attempt=0
+        pipe=$(find_agent_pipe) || die "no powershell.exe; cannot reach the Windows ssh-agent from here."
+        [ -n "$pipe" ] || die "no ssh-agent pipe on the Windows side.
+    Start KeePassXC, enable Tools > Settings > SSH Agent, and unlock your database."
+        info "pipe: \\\\.\\pipe\\$pipe"
+
+        eval "$("${NIX[@]}" run "$NIXPKGS#wsl2-ssh-agent" -- \
+            --socket "$AGENT_SOCK" --pipename "$pipe" </dev/null)"
+        info "socket: ${SSH_AUTH_SOCK:-unset}"
+
+        until agent_has_keys; do
+            attempt=$((attempt + 1))
+            [ "$attempt" -le 3 ] || die "the Windows ssh-agent is still not offering any keys."
+            pause "Unlock KeePassXC (its SSH Agent integration must be enabled), then press Enter: " \
+                "the Windows ssh-agent is reachable but has no keys; unlock KeePassXC and re-run."
+        done
+    fi
+
+    info "keys: $(ssh-add -l | wc -l) offered by the agent"
+}
+
+check_github() {
+    step "Authenticating to GitHub"
+
+    local greeting
+    greeting=$(ssh -o BatchMode=yes -T git@github.com 2>&1 </dev/null) || true
+    case $greeting in
+    *"successfully authenticated"*) info "$greeting" ;;
+    *) die "GitHub did not accept any of the agent's keys:
+    $greeting" ;;
+    esac
+}
+
+fetch_config() {
+    step "Fetching the home-manager config"
+
+    local git=("${NIX[@]}" shell "$NIXPKGS#git" -c git)
+    if [ -d "$HM_DIR/.git" ]; then
+        info "$HM_DIR already exists; updating"
+        "${git[@]}" -C "$HM_DIR" pull --ff-only
+    else
+        mkdir -p "$(dirname "$HM_DIR")"
+        "${git[@]}" clone "$HM_REPO" "$HM_DIR"
+    fi
+}
+
+pick_attribute() {
+    [ -z "${HM_ATTR:-}" ] || return 0
+
+    local attrs candidate
+    attrs=$("${NIX[@]}" eval --raw "$HM_DIR#homeConfigurations" \
+        --apply 'cs: builtins.concatStringsSep "\n" (builtins.attrNames cs)')
+    for candidate in "$USER_NAME@$HOST_NAME" "$USER_NAME" default; do
+        if printf '%s\n' "$attrs" | grep -qxF "$candidate"; then
+            HM_ATTR=$candidate
+            return 0
+        fi
+    done
+
+    die "no configuration for $USER_NAME@$HOST_NAME in $HM_DIR; it defines: $(printf '%s' "$attrs" | tr '\n' ' ')"
+}
+
+activate() {
+    local generation
+
+    step "Building homeConfigurations.\"$HM_ATTR\""
+    generation=$("${NIX[@]}" build --no-link --print-out-paths \
+        "$HM_DIR#homeConfigurations.\"$HM_ATTR\".activationPackage")
+    info "$generation"
+
+    step "Activating"
+    # Dotfiles that are in the way are kept as *.bak rather than aborting.
+    HOME_MANAGER_BACKUP_EXT=bak "$generation/activate"
+}
+
+main() {
+    check_environment
+    prepare_ssh_dir
+    bridge_agent
+    check_github
+    fetch_config
+    pick_attribute
+    activate
+
+    step "Done"
+    info "config checkout: $HM_DIR"
+    info "apply changes with: home-manager switch --flake $HM_DIR#$HM_ATTR"
+    info "start a new login shell to pick up the environment: exec bash -l"
+}
+
+# Called on the last line so bash has parsed the whole script before any of it
+# runs — see the fd 0 note above find_agent_pipe.
+main "$@"
